@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Adrobot — обёртка над Keitaro</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app" v-cloak>
+  <header class="top">
+    <h1>Adrobot</h1>
+    <span class="muted">обёртка над Keitaro</span>
+  </header>
+
+  <p v-if="error" class="alert alert-error" role="alert">
+    {{ error }} <button class="link" @click="error = ''">закрыть</button>
+  </p>
+  <p v-if="notice" class="alert alert-ok" role="status">{{ notice }}</p>
+
+  <main class="layout">
+    <!-- Левая колонка: создание и выбор кампании -->
+    <aside class="side">
+      <section class="card">
+        <h2>Новая кампания</h2>
+        <form @submit.prevent="createCampaign">
+          <label>Название
+            <input v-model.trim="form.name" required maxlength="200" placeholder="имя кампании">
+          </label>
+          <p class="hint" v-if="meta.prefix">Префикс <code>{{ meta.prefix }}</code> добавится сам.</p>
+
+          <label>Гео
+            <input v-model.trim="form.geo" required placeholder="AU или MX,AU,RO">
+          </label>
+          <p class="hint">Посетители из этих стран уйдут на {{ meta.redirect_url || 'Google' }}.</p>
+
+          <label>Оффер</label>
+          <offer-picker v-model="form.offer" placeholder="поиск по названию или ID"></offer-picker>
+
+          <details>
+            <summary>Домен, группа, источник</summary>
+            <label>Домен
+              <select v-model="form.domain_id">
+                <option v-for="item in meta.domains" :key="item.id" :value="item.id">{{ item.name }}</option>
+              </select>
+            </label>
+            <label>Группа
+              <select v-model="form.group_id">
+                <option v-for="item in meta.groups" :key="item.id" :value="item.id">{{ item.name }}</option>
+              </select>
+            </label>
+            <label>Источник
+              <select v-model="form.source_id">
+                <option v-for="item in meta.sources" :key="item.id" :value="item.id">{{ item.name }}</option>
+              </select>
+            </label>
+          </details>
+
+          <button class="btn btn-primary" :disabled="busy || !form.offer">Создать</button>
+        </form>
+      </section>
+
+      <section class="card">
+        <h2>Открыть кампанию</h2>
+        <input v-model.trim="campaignQuery" @input="searchCampaigns" placeholder="поиск в Keitaro по названию или ID">
+        <ul class="list">
+          <li v-for="item in keitaroCampaigns" :key="item.keitaro_id">
+            <button class="link" @click="openCampaign(item.keitaro_id)">{{ item.name }}</button>
+            <span class="muted">#{{ item.keitaro_id }}</span>
+          </li>
+          <li v-if="!keitaroCampaigns.length" class="muted">Ничего не найдено.</li>
+        </ul>
+      </section>
+    </aside>
+
+    <!-- Правая колонка: редактор -->
+    <section class="editor">
+      <div v-if="!campaign" class="card empty">
+        Создайте кампанию или откройте существующую — здесь появится редактор потоков.
+      </div>
+
+      <template v-else>
+        <div class="card editor-head">
+          <div>
+            <h2>{{ campaign.name }}</h2>
+            <span class="muted">Keitaro ID {{ campaign.keitaro_id }}<template v-if="campaign.geo"> · гео {{ campaign.geo }}</template></span>
+          </div>
+          <button class="btn" :disabled="busy" @click="fetchStreams">Fetch streams from KT</button>
+        </div>
+
+        <div v-for="stream in campaign.streams" :key="stream.id" class="card stream" :class="{ dirty: stream.dirty }">
+          <div class="stream-head">
+            <div>
+              <strong>{{ stream.name }}</strong>
+              <span class="muted"> · stream_id {{ stream.keitaro_id }}</span>
+              <span v-if="stream.dirty" class="badge">не опубликовано</span>
+            </div>
+            <div v-if="stream.has_offers && stream.dirty" class="actions">
+              <button class="btn btn-primary" :disabled="busy" @click="pushStream(stream)">Push to KT</button>
+              <button class="btn" :disabled="busy" @click="cancelStream(stream)">Cancel</button>
+            </div>
+          </div>
+
+          <p v-if="!stream.has_offers" class="muted">Поток без офферов — в редакторе не меняется.</p>
+
+          <template v-else>
+            <table>
+              <thead>
+                <tr><th>Оффер</th><th class="num">Доля</th><th class="right">Действия</th></tr>
+              </thead>
+              <tbody>
+                <tr v-for="offer in stream.offers" :key="offer.id" :class="{ removed: offer.status === 'removed' }">
+                  <td>
+                    <span class="muted">{{ offer.offer_id }}</span> {{ offer.name }}
+                    <span v-if="offer.is_new" class="badge">новый</span>
+                    <span v-if="offer.status === 'removed'" class="muted">(removed)</span>
+                  </td>
+                  <td class="num">
+                    <template v-if="offer.status === 'active'">
+                      <input v-if="offer.pinned" class="share" type="number" min="0" max="100"
+                             :value="offer.share" :aria-label="'Доля оффера ' + offer.name"
+                             @change="setPin(offer, true, $event.target.value)">
+                      <span v-else>{{ offer.share }}</span>%
+                      <button class="pin" :class="{ on: offer.pinned }"
+                              :title="offer.pinned ? 'Открепить долю' : 'Закрепить долю'"
+                              :aria-pressed="offer.pinned"
+                              @click="setPin(offer, !offer.pinned, offer.share)">📌</button>
+                    </template>
+                    <span v-else>0%</span>
+                  </td>
+                  <td class="right">
+                    <button v-if="offer.status === 'active'" class="btn btn-small" @click="removeOffer(offer)">Remove</button>
+                    <button v-else class="btn btn-small" @click="restoreOffer(offer)">Bring back</button>
+                  </td>
+                </tr>
+              </tbody>
+              <tfoot>
+                <tr>
+                  <td>Итого</td>
+                  <td class="num" :class="{ bad: stream.total_share !== 100 }">{{ stream.total_share }}%</td>
+                  <td></td>
+                </tr>
+              </tfoot>
+            </table>
+
+            <div class="add-row">
+              <offer-picker v-model="picked[stream.id]" placeholder="добавить оффер: название или ID"></offer-picker>
+              <button class="btn" :disabled="busy || !picked[stream.id]" @click="addOffer(stream)">Add</button>
+            </div>
+          </template>
+        </div>
+      </template>
+    </section>
+  </main>
+</div>
+
+<script src="/static/vendor/vue.global.prod.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
